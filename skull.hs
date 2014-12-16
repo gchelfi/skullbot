@@ -4,7 +4,6 @@ import System.Exit
 import Text.Printf
 import Data.List
 import Control.Exception
-import Control.Monad (replicateM)
 import Control.Monad.State
 import Control.Concurrent (threadDelay)
 import qualified Data.Map.Strict as Map
@@ -68,13 +67,12 @@ addPlayer p = do
   modify (\s -> s { players = players s ++ [p]
                   , statuses = Map.insert p (initStatus) (statuses s) })
   privmsg $ p ++ " a rejoint la partie !"
-  where insert x xs = if x `elem` xs then xs else x:xs
 
 removePlayer :: Player -> Net ()
 removePlayer p = do
   modify (\s -> s { players = delete p (players s), statuses = Map.delete p (statuses s) })
-  ap <- gets activePlayer
-  when (Just p == ap) $ nextPlayer
+  ap' <- gets activePlayer
+  when (Just p == ap') $ nextPlayer
 
 command :: Message -> Net ()
 command m | c == "!play" = play
@@ -94,19 +92,17 @@ command m | c == "!play" = play
           | "!pop" `isPrefixOf` c = pop m
           | "!push" `isPrefixOf` c = push m
           | "!rm " `isPrefixOf` c = removePlayer $ drop 4 c
-          | c == "!phase" = do
-              phase <- gets phase
-              privmsg $ show phase
+          | c == "!phase" = gets phase >>= (privmsg . show)
           | otherwise = return ()
   where c = content m
 
 play :: Net ()
 play = do
-  phase <- gets phase
-  players <- gets players
-  when (phase == Preparation) $ do
+  phase' <- gets phase
+  players' <- gets players
+  when (phase' == Preparation) $ do
     changePhase StackConstruction
-    privmsg $ "Ordre: " ++pprint players++"."
+    privmsg $ "Ordre: " ++pprint players'++"."
     nextPlayer
     newTurn
   where pprint = concat . intersperse ", "
@@ -116,9 +112,9 @@ changePhase p = do
   modify (\s -> s {phase = p})
   privmsg $ "On passe en phase de "++(map toLower $ show p)++" !"
   when (p == Resolution) $ do
-    ap <- gets activePlayer
-    case ap of
-     Just p -> popSelf p >> recapAll
+    ap' <- gets activePlayer
+    case ap' of
+     Just p' -> popSelf p' >> recapAll
      Nothing -> return ()
 
 quit :: Net ()
@@ -126,9 +122,9 @@ quit = modify $ initSkullBot . socket
 
 joinPlayer :: Player -> Net ()
 joinPlayer p = do
-  players <- gets players
-  phase <- gets phase
-  when (phase == Preparation && (not $ p `elem` players)) $ addPlayer p
+  players' <- gets players
+  phase' <- gets phase
+  when (phase' == Preparation && (not $ p `elem` players')) $ addPlayer p
 
 countStacks :: Net Int
 countStacks = gets $ Map.foldl' (flip $ (+) . length . stack) 0 . statuses
@@ -203,8 +199,8 @@ pass m = do
 popSelf :: Player -> Net ()
 popSelf p = do
   go <- popOthers p p
-  currentBid <- gets currentBid
-  when (currentBid > 0 && go) $ popSelf p
+  currentBid' <- gets currentBid
+  when (currentBid' > 0 && go) $ popSelf p
 
 pop :: Message -> Net ()
 pop m = do
@@ -212,7 +208,7 @@ pop m = do
   when ((Just $ author m) == activePlayer sk &&
         phase sk == Resolution) $ do
     let target = drop 5 $ content m
-    popOthers (author m) target
+    _ <- popOthers (author m) target
     recapAll
 
 popOthers :: Player -> Player -> Net Bool
@@ -233,15 +229,16 @@ popOthers p target = do
      return False
 
 updatePoints :: Player -> Net ()
-updatePoints p = do
+updatePoints p' = do
   st <- gets statuses
-  case Map.lookup p st of
+  case Map.lookup p' st of
    Just s -> if points s > 0
-             then quit >> (privmsg $ "Félicitations "++p++", tu as gagné !")
+             then quit >> (privmsg $ "Félicitations "++p'++", tu as gagné !")
              else do
-               updateStatus p (\s -> s {points = points s + 1})
-               privmsg $ "Bien joué "++p++", tu marques un point !"
+               updateStatus p' (\s' -> s' {points = points s + 1})
+               privmsg $ "Bien joué "++p'++", tu marques un point !"
                newTurn
+   Nothing -> return ()
 
 newTurn :: Net ()
 newTurn = do
@@ -260,7 +257,8 @@ notifHand p = do
    Nothing -> return ()
   where
     printHand :: Player -> Hand -> Net ()
-    printHand p h = notify p $ concat $ intersperse " " $ zipWith (\i c -> show i ++ ":" ++ show c) [0..] h
+    printHand p' h = notify p' $ concat $ intersperse " " $
+            zipWith (\i c -> show i ++ ":" ++ show c) [(0 :: Integer)..] h
 
 collectStack :: Status -> Status
 collectStack s = s { hand = hand s ++ map (either id id) (stack s), stack = [] }
@@ -290,9 +288,9 @@ push :: Message -> Net ()
 push m = do
   let p = author m
       n = read $ drop 6 $ content m
-  ap <- gets activePlayer
-  phase <- gets phase
-  when (Just p == ap && phase == StackConstruction) $ do
+  ap' <- gets activePlayer
+  phase' <- gets phase
+  when (Just p == ap' && phase' == StackConstruction) $ do
     playCard p n
     notifHand p
 
@@ -305,8 +303,8 @@ playCard p i = do
      updateStatus p (pour i)
      nextPlayer
   where
-       pour i s = s { stack = (Left $ (hand s) !! i) : stack s
-                    , hand = removeNth i $ hand s}
+       pour i' s = s { stack = (Left $ (hand s) !! i') : stack s
+                     , hand = removeNth i' $ hand s}
        removeNth _ [] = []
        removeNth 0 (_:l) = l
        removeNth n (x:xs) = x : removeNth (n-1) xs
@@ -321,7 +319,7 @@ revealCard p = do
      case h of
       Nothing -> return Nothing
       Just _ -> do
-        updateStatus p (\st -> st {stack = s'})
+        updateStatus p (\st' -> st' {stack = s'})
         return h
 
 type Net = StateT SkullBot IO
@@ -336,15 +334,15 @@ main = bracket connect disconnect loop
     loop = runStateT run
 
 connect :: IO SkullBot
-connect = notify $ do
+connect = notify' $ do
   h <- connectTo server (PortNumber (fromIntegral port))
   hSetBuffering h NoBuffering
   return (initSkullBot h)
   where
-    notify a = bracket_
-               (printf "Connecting to %s ... " server >> hFlush stdout)
-               (putStrLn "done.")
-               a
+    notify' a = bracket_
+                (printf "Connecting to %s ... " server >> hFlush stdout)
+                (putStrLn "done.")
+                a
 
 run :: Net ()
 run = do
@@ -361,19 +359,19 @@ waitForPing :: Handle -> Net ()
 waitForPing h = listen (const $ waitForPing h) h
 
 listen :: (Message -> Net ()) -> Handle -> Net ()
-listen eval h = do
+listen eval' h = do
   s <- init `fmap` io (hGetLine h)
   io (putStrLn s)
-  if ping s then pong s else eval (parse s)
+  if ping s then pong s else eval' (parse s)
   where
-    parse s = Message header author (drop 1 $ content) mType
+    parse s = Message header' author' (drop 1 $ content') mType'
       where
-        (header, content) = span (/= ':') $ drop 1 s
-        author = takeWhile (/= '!') header
-        mType | "JOIN " `isSuffixOf` header = JOIN
-              | "PRIVMSG" `isInfixOf` header = PRIVMSG
-              | "PART " `isSuffixOf` header = PART
-              | otherwise = Unknown
+        (header', content') = span (/= ':') $ drop 1 s
+        author' = takeWhile (/= '!') header'
+        mType' | "JOIN " `isSuffixOf` header' = JOIN
+               | "PRIVMSG" `isInfixOf` header' = PRIVMSG
+               | "PART " `isSuffixOf` header' = PART
+               | otherwise = Unknown
 
 data Message = Message { header :: String,
                          author :: String,
@@ -395,7 +393,7 @@ pong x = write "PONG" (':' : drop 6 x)
 write :: String -> String -> Net ()
 write s t = do
   h <- gets socket
-  io $ hPrintf h "%s %s\r\n" s t
+  _ <- io $ hPrintf h "%s %s\r\n" s t
   io $ printf "> %s %s\n" s t
 
 welcome :: String -> Net ()
