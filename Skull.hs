@@ -1,28 +1,21 @@
-import Network
-import System.IO
-import System.Exit
-import Text.Printf
+module Skull ( SkullGame
+             , SkullInfo(..)
+             , Log(..)
+             , initSkullInfo
+             , command
+             ) where
+
+import Message
 import Data.List
-import Control.Exception
+
 import Control.Monad.State
-import Control.Concurrent (threadDelay)
+
 import qualified Data.Map.Strict as Map
 import Data.Random.Extras (shuffle)
 import Data.Random.RVar (runRVar)
 import Data.Random.Source.DevRandom (DevRandom( DevURandom ))
 import Data.Char (toLower)
 
-server :: String
-server = "irc.rezel.net"
-
-port :: Int
-port = 6667
-
-chan :: String
-chan = "#skull"
-
-nick :: String
-nick = "skullbot"
 
 type Player = String
 data Head = Skull | Flower
@@ -30,6 +23,8 @@ data Head = Skull | Flower
 instance Show Head where
   show Skull = "C"
   show Flower = "F"
+
+data Log = Public String | Private String String
 
 type Card = Either Head Head
 type Hand = [Head]
@@ -44,97 +39,99 @@ instance Show Phase where
   show Resolution = "Résolution"
 
 data Status = Status { hand :: Hand, stack :: Stack, points :: Int }
-data SkullBot = SkullBot { socket :: Handle
-                     , phase :: Phase
-                     , players :: [Player]
-                     , statuses :: Map.Map Player Status
-                     , activePlayer :: Maybe Player
-                     , lastBid :: Maybe Player
-                     , currentBid :: Int
-                     }
+data SkullInfo = SkullInfo { phase :: Phase
+                           , players :: [Player]
+                           , statuses :: Map.Map Player Status
+                           , activePlayer :: Maybe Player
+                           , lastBid :: Maybe Player
+                           , currentBid :: Int
+                           , logs :: [Log]
+                           }
 
-initSkullBot :: Handle -> SkullBot
-initSkullBot s = SkullBot s Preparation [] Map.empty Nothing Nothing 0
+type SkullGame m = StateT SkullInfo m
+
+initSkullInfo :: SkullInfo
+initSkullInfo = SkullInfo Preparation [] Map.empty Nothing Nothing 0 []
 
 initStatus :: Status
 initStatus = Status [Skull, Flower, Flower, Flower] [] 0
 
-updateStatus :: Player -> (Status -> Status) -> Net ()
+updateStatus :: (Monad m) => Player -> (Status -> Status) -> SkullGame m ()
 updateStatus p f = modify (\sk -> sk { statuses = Map.adjust f p $ statuses sk})
 
-addPlayer :: Player -> Net ()
+addPlayer :: (Monad m) => Player -> SkullGame m ()
 addPlayer p = do
   modify (\s -> s { players = players s ++ [p]
                   , statuses = Map.insert p (initStatus) (statuses s) })
-  privmsg $ p ++ " a rejoint la partie !"
+  publicLog $ p ++ " a rejoint la partie !"
 
-removePlayer :: Player -> Net ()
+removePlayer :: (Monad m) => Player -> SkullGame m ()
 removePlayer p = do
   modify (\s -> s { players = delete p (players s), statuses = Map.delete p (statuses s) })
   ap' <- gets activePlayer
   when (Just p == ap') $ nextPlayer
 
-command :: Message -> Net ()
+command :: (Monad m) => Message -> SkullGame m ()
 command m | c == "!play" = play
           | c == "!join" = joinPlayer (author m)
           | any (c ==) ["!nbcards", "!nbcard","!nb"] = do
               nbcards <- countStacks
-              privmsg $ "Il reste " ++show nbcards ++" cartes."
+              publicLog $ "Il reste " ++show nbcards ++" cartes."
           | c == "!recap" = recapAll
-          | c == "!quit" = quit >> privmsg "Partie annulée."
+          | c == "!quit" = quit >> publicLog "Partie annulée."
           | c == "!suiv" = do
               active <- gets activePlayer
               case active of
-               Just p -> privmsg p
+               Just p -> publicLog p
                Nothing -> return ()
           | "!bid" `isPrefixOf` c = bid m
           | c == "!pass" = pass m
           | "!pop" `isPrefixOf` c = pop m
           | "!push" `isPrefixOf` c = push m
           | "!rm " `isPrefixOf` c = removePlayer $ drop 4 c
-          | c == "!phase" = gets phase >>= (privmsg . show)
+          | c == "!phase" = gets phase >>= (publicLog . show)
           | otherwise = return ()
   where c = content m
 
-play :: Net ()
+play :: (Monad m) => SkullGame m ()
 play = do
   phase' <- gets phase
   players' <- gets players
   when (phase' == Preparation) $ do
     changePhase StackConstruction
-    privmsg $ "Ordre: " ++pprint players'++"."
+    publicLog $ "Ordre: " ++pprint players'++"."
     nextPlayer
     newTurn
   where pprint = concat . intersperse ", "
 
-changePhase :: Phase -> Net ()
+changePhase :: (Monad m) => Phase -> SkullGame m ()
 changePhase p = do
   modify (\s -> s {phase = p})
-  privmsg $ "On passe en phase de "++(map toLower $ show p)++" !"
+  publicLog $ "On passe en phase de "++(map toLower $ show p)++" !"
   when (p == Resolution) $ do
     ap' <- gets activePlayer
     case ap' of
      Just p' -> popSelf p' >> recapAll
      Nothing -> return ()
 
-quit :: Net ()
-quit = modify $ initSkullBot . socket
+quit :: (Monad m) => SkullGame m ()
+quit = modify $ const initSkullInfo
 
-joinPlayer :: Player -> Net ()
+joinPlayer :: (Monad m) => Player -> SkullGame m ()
 joinPlayer p = do
   players' <- gets players
   phase' <- gets phase
   when (phase' == Preparation && (not $ p `elem` players')) $ addPlayer p
 
-countStacks :: Net Int
+countStacks :: (Monad m) => SkullGame m Int
 countStacks = gets $ Map.foldl' (flip $ (+) . length . stack) 0 . statuses
 
 
-recapPlayer :: Player -> Net ()
+recapPlayer :: (Monad m) => Player -> SkullGame m ()
 recapPlayer p = do
   hs <- gets $ Map.lookup p . statuses
   case hs of
-   Just s -> privmsg $
+   Just s -> publicLog $
              p ++ ": " ++ show (length $ hand s) ++ " cartes, " ++
              show (points s) ++ " point, " ++
              showStack (stack s) ++ "."
@@ -144,29 +141,29 @@ showStack :: Stack -> String
 showStack [] = "[]"
 showStack s = concat . map (either (const "*") show) $ s
 
-recapAll :: Net ()
+recapAll :: (Monad m) => SkullGame m ()
 recapAll = do
   skull <- get
   mapM_ recapPlayer $ players skull
   case lastBid skull of
    Just p -> when (currentBid skull > 0) $
              if (phase skull == Resolution)
-             then privmsg $ p ++ " doit encore retourner " ++ show (currentBid skull) ++ " fleurs."
-             else privmsg $ p ++ " pense pouvoir retourner " ++ show (currentBid skull) ++ " fleurs."
+             then publicLog $ p ++ " doit encore retourner " ++ show (currentBid skull) ++ " fleurs."
+             else publicLog $ p ++ " pense pouvoir retourner " ++ show (currentBid skull) ++ " fleurs."
    Nothing -> return ()
 
-nextPlayer :: Net ()
+nextPlayer :: (Monad m) => SkullGame m ()
 nextPlayer = do
   sk <- get
   case players sk of
    [] -> modify (\s -> s { activePlayer = Nothing })
    (x:xs) -> do
      modify (\s -> s { activePlayer = Just x, players = xs ++ [x] })
-     privmsg $ "C'est au tour de "++x++" !"
+     publicLog $ "C'est au tour de "++x++" !"
      when (Just x == lastBid sk && phase sk == Bidding) $ changePhase Resolution
 
 
-bid :: Message -> Net ()
+bid :: (Monad m) => Message -> SkullGame m ()
 bid m = do
   skull <- get
   max_bid <- countStacks
@@ -183,12 +180,11 @@ bid m = do
       then changePhase Resolution
       else (changePhase Bidding) >> nextPlayer
   where
-    allPlayed :: Net Bool
     allPlayed = do
       st <- gets statuses
       return $ Map.foldl' (\acc s -> acc && (length $ stack s) >= 1) True st
 
-pass :: Message -> Net ()
+pass :: (Monad m) => Message -> SkullGame m ()
 pass m = do
   skull <- get
   when ((Just $ author m) == activePlayer skull &&
@@ -196,13 +192,13 @@ pass m = do
     nextPlayer
     when (activePlayer skull == lastBid skull) $ changePhase Resolution
 
-popSelf :: Player -> Net ()
+popSelf :: (Monad m) => Player -> SkullGame m ()
 popSelf p = do
   go <- popOthers p p
   currentBid' <- gets currentBid
   when (currentBid' > 0 && go) $ popSelf p
 
-pop :: Message -> Net ()
+pop :: (Monad m) => Message -> SkullGame m ()
 pop m = do
   sk <- get
   when ((Just $ author m) == activePlayer sk &&
@@ -211,7 +207,7 @@ pop m = do
     _ <- popOthers (author m) target
     recapAll
 
-popOthers :: Player -> Player -> Net Bool
+popOthers :: (Monad m) => Player -> Player -> SkullGame m Bool
 popOthers p target = do
   h <- revealCard target
   case h of
@@ -223,24 +219,24 @@ popOthers p target = do
        then (updatePoints p) >> return False
        else return True
    Just Skull -> do
-     privmsg $ p ++" a pioché un crâne !"
+     publicLog $ p ++" a pioché un crâne !"
      removeCard p
      newTurn
      return False
 
-updatePoints :: Player -> Net ()
+updatePoints :: (Monad m) => Player -> SkullGame m ()
 updatePoints p' = do
   st <- gets statuses
   case Map.lookup p' st of
    Just s -> if points s > 0
-             then quit >> (privmsg $ "Félicitations "++p'++", tu as gagné !")
+             then quit >> (publicLog $ "Félicitations "++p'++", tu as gagné !")
              else do
                updateStatus p' (\s' -> s' {points = points s + 1})
-               privmsg $ "Bien joué "++p'++", tu marques un point !"
+               publicLog $ "Bien joué "++p'++", tu marques un point !"
                newTurn
    Nothing -> return ()
 
-newTurn :: Net ()
+newTurn :: (Monad m) => SkullGame m ()
 newTurn = do
   collectAllStacks
   modify (\sk -> sk { phase = StackConstruction
@@ -249,21 +245,21 @@ newTurn = do
                     })
   gets players >>= mapM_ notifHand
 
-notifHand :: Player -> Net ()
+notifHand :: (Monad m) => Player -> SkullGame m ()
 notifHand p = do
   sk <- get
   case Map.lookup p (statuses sk) of
    Just s -> printHand p $ hand s
    Nothing -> return ()
   where
-    printHand :: Player -> Hand -> Net ()
-    printHand p' h = notify p' $ concat $ intersperse " " $
-            zipWith (\i c -> show i ++ ":" ++ show c) [(0 :: Integer)..] h
+    printHand p' h =
+      privateLog p' $ concat $ intersperse " " $
+      zipWith (\i c -> show i ++ ":" ++ show c) [(0 :: Integer)..] h
 
 collectStack :: Status -> Status
 collectStack s = s { hand = hand s ++ map (either id id) (stack s), stack = [] }
 
-collectAllStacks :: Net ()
+collectAllStacks :: (Monad m) => SkullGame m ()
 collectAllStacks = do
   sk <- get
   forM_ (players sk) $ \p -> do
@@ -271,10 +267,10 @@ collectAllStacks = do
      Nothing -> return ()
      Just s -> do
        let s' = collectStack s
-       h <- listShuffle $ hand s'
+       h <- return $  listShuffle $ hand s'
        updateStatus p (\_ -> s' {hand = h})
 
-removeCard :: Player -> Net ()
+removeCard :: (Monad m) => Player -> SkullGame m ()
 removeCard p = updateStatus p (\s -> s {hand = tail $ hand s})
 
 popStack :: Stack -> (Maybe Head, Stack)
@@ -284,7 +280,7 @@ popStack s = aux [] s
     aux acc (c@(Right _):cs) = aux (acc ++ [c]) cs
     aux acc ((Left h):cs) = (Just h, acc ++ [Right h] ++ cs)
 
-push :: Message -> Net ()
+push :: (Monad m) => Message -> SkullGame m ()
 push m = do
   let p = author m
       n = read $ drop 6 $ content m
@@ -294,7 +290,7 @@ push m = do
     playCard p n
     notifHand p
 
-playCard :: Player -> Int -> Net ()
+playCard :: (Monad m) => Player -> Int -> SkullGame m ()
 playCard p i = do
   st <- gets statuses
   case Map.lookup p st of
@@ -309,7 +305,7 @@ playCard p i = do
        removeNth 0 (_:l) = l
        removeNth n (x:xs) = x : removeNth (n-1) xs
 
-revealCard :: Player -> Net (Maybe Head)
+revealCard :: (Monad m) => Player -> SkullGame m (Maybe Head)
 revealCard p = do
   st <- gets statuses
   case Map.lookup p st of
@@ -322,89 +318,21 @@ revealCard p = do
         updateStatus p (\st' -> st' {stack = s'})
         return h
 
-type Net = StateT SkullBot IO
 
-io :: IO a -> Net a
-io = liftIO
+publicLog :: (Monad m) => String -> SkullGame m ()
+publicLog s = modify (\sk -> sk { logs = (logs sk) ++ [Public s] })
 
-main :: IO ((), SkullBot)
-main = bracket connect disconnect loop
-  where
-    disconnect = hClose . socket
-    loop = runStateT run
+privateLog :: (Monad m) => String -> String -> SkullGame m ()
+privateLog p s = modify (\sk -> sk { logs = (logs sk) ++ [Private p s] })
 
-connect :: IO SkullBot
-connect = notify' $ do
-  h <- connectTo server (PortNumber (fromIntegral port))
-  hSetBuffering h NoBuffering
-  return (initSkullBot h)
-  where
-    notify' a = bracket_
-                (printf "Connecting to %s ... " server >> hFlush stdout)
-                (putStrLn "done.")
-                a
 
-run :: Net ()
-run = do
-  write "NICK" nick
-  write "USER" (nick++" 0 * :skull'n'roses bot")
-  h <- gets socket
-  waitForPing h
-  io $ threadDelay 1000000
-  write "JOIN" chan
-  forever $ do
-    listen eval h
 
-waitForPing :: Handle -> Net ()
-waitForPing h = listen (const $ waitForPing h) h
+listShuffle :: [a] -> [a]
+listShuffle = id
+--listShuffle l = runRVar (shuffle l) DevURandom
 
-listen :: (Message -> Net ()) -> Handle -> Net ()
-listen eval' h = do
-  s <- init `fmap` io (hGetLine h)
-  io (putStrLn s)
-  if ping s then pong s else eval' (parse s)
-  where
-    parse s = Message header' author' (drop 1 $ content') mType'
-      where
-        (header', content') = span (/= ':') $ drop 1 s
-        author' = takeWhile (/= '!') header'
-        mType' | "JOIN " `isSuffixOf` header' = JOIN
-               | "PRIVMSG" `isInfixOf` header' = PRIVMSG
-               | "PART " `isSuffixOf` header' = PART
-               | otherwise = Unknown
-
-data Message = Message { header :: String,
-                         author :: String,
-                         content :: String,
-                         mType :: MessageType }
-
-data MessageType = JOIN |
-                   PRIVMSG |
-                   PART |
-                   Unknown
-                 deriving Eq
-
-ping :: String -> Bool
-ping x = "PING :" `isPrefixOf` x
-
-pong :: String -> Net ()
-pong x = write "PONG" (':' : drop 6 x)
-
-write :: String -> String -> Net ()
-write s t = do
-  h <- gets socket
-  _ <- io $ hPrintf h "%s %s\r\n" s t
-  io $ printf "> %s %s\n" s t
-
-welcome :: String -> Net ()
-welcome s | s == "kinnian" || s == "coin" || s == "traklon" || s == "Fraulol" = privmsg (s ++ " ! <3")
-          | otherwise = return ()
-
-killBot :: Net ()
-killBot = write "QUIT" ":Exiting" >> io (exitWith ExitSuccess)
-
-help :: String -> Net ()
-help user = mapM_ (notify user) $ lines helpMsg
+help :: (Monad m) => String -> SkullGame m ()
+help user = mapM_ (privateLog user) $ lines helpMsg
   where
     helpMsg = "\
 \    !help: Afficher cette aide.\n\
@@ -422,16 +350,3 @@ help user = mapM_ (notify user) $ lines helpMsg
 \    !pop nick: Retourner la première carte cachée d'un joueur.\n\
 \    !bid nb: Faire une annonce.\n\
 \ "
-
-eval :: Message -> Net ()
-eval m | mType m == PRIVMSG = command m
-       | otherwise = return ()
-
-privmsg :: String -> Net ()
-privmsg msg = write "PRIVMSG" (chan ++ " :" ++ msg)
-
-notify :: String -> String -> Net ()
-notify user msg = write "NOTICE" (user ++ " :" ++ msg)
-
-listShuffle :: [a] -> Net [a]
-listShuffle l = io $ runRVar (shuffle l) DevURandom
