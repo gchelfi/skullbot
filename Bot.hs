@@ -1,4 +1,4 @@
-module Bot () where
+module Bot (main) where
 
 import Data.List
 import Skull
